@@ -100,7 +100,7 @@
   <div id="frame">
     <canvas id="game" width="800" height="500"></canvas>
   </div>
-  <div id="hint">use WASD or arrow keys to guide barry &middot; avoid being picked up by matt and jo!</div>
+  <div id="hint">use WASD or arrow keys to guide barry &middot; avoid being picked up by matt and jo &middot; watch out for rotten veggies!</div>
 </div>
 
 <div id="nameModal" class="modal-overlay" hidden>
@@ -178,6 +178,7 @@ let barrySprite = null;   // preprocessed pixel-art canvas of Barry
 let barryAspect = 1;
 let barrySpriteRedTint = null;
 let barrySpriteGoldTint = null;
+let barrySpriteReverseTint = null;
 const veggieSprites = {}; // id -> pixel-art canvas
 let fieldTexture = null;  // pre-rendered grass texture
 let mattSprite = null, joSprite = null; // pixel-art chaser sprites
@@ -204,6 +205,7 @@ const barry = {
   boostSpeed: 720,
   slowTimer: 0,
   boostTimer: 0,
+  reverseTimer: 0,
   hitCooldown: 0,
   hopPhase: 0,
   moving: false,
@@ -213,7 +215,6 @@ let chasers = [];
 let veggies = [];
 let popups = [];
 let buttons = [];
-let bananaCooldown = 6;
 const MAX_CHASERS = 3;
 const TARGET_VEGGIE_SIZE = 37; // normalizes on-field size regardless of a sprite's native pixel resolution
 
@@ -241,27 +242,72 @@ async function submitScore(name, points) {
 
 // ---------- Veggie definitions ----------
 const VEG_TYPES = [
-  { id: 'carrot',  points: 10,  weight: 30, name: 'Carrot Bonus' },
-  { id: 'bokchoy', points: 30,  weight: 25, name: 'Bok Choy' },
-  { id: 'lettuce', points: 50,  weight: 20, name: 'Lettuce' },
-  { id: 'parsley', points: 80,  weight: 12, name: 'Parsley' },
-  { id: 'dill',    points: 100, weight: 8,  name: 'Dill' },
-  { id: 'banana',  points: 200, weight: 3,  name: 'Banana' },
+  { id: 'carrot',  points: 10,  name: 'Carrot' },
+  { id: 'lettuce', points: 50,  name: 'Lettuce' },
+  { id: 'banana',  points: 200, name: 'Banana' },
 ];
-const NON_BANANA_TYPES = VEG_TYPES.filter(v => v.id !== 'banana');
-const NON_BANANA_WEIGHT = NON_BANANA_TYPES.reduce((s, v) => s + v.weight, 0);
-const TOTAL_WEIGHT = VEG_TYPES.reduce((s, v) => s + v.weight, 0);
-function pickVeggieType() {
-  // bananas are a rare speed-boost power-up: gated behind a cooldown so at
-  // most one can appear every so often, on top of already being low-weight.
-  const pool = bananaCooldown > 0 ? NON_BANANA_TYPES : VEG_TYPES;
-  const totalWeight = bananaCooldown > 0 ? NON_BANANA_WEIGHT : TOTAL_WEIGHT;
-  let r = Math.random() * totalWeight;
-  for (const v of pool) {
-    if (r < v.weight) return v;
-    r -= v.weight;
+const VEG_BY_ID = Object.fromEntries(VEG_TYPES.map(v => [v.id, v]));
+const ROTTEN_TYPE = { id: 'rotten', points: 0, name: 'Rotten Veggie' };
+
+// A full round's veggies are a fixed, shuffled preset (not open-ended random
+// spawns), so a perfect game always tops out at exactly TARGET_SCORE.
+const TARGET_SCORE = 5000;
+const GAME_DURATION = 60;
+const PRESET_COUNTS = { banana: 2, carrot: 10, lettuce: 90 }; // 2*200 + 10*10 + 90*50 = 5000
+const ROTTEN_COUNT = 2;
+const MIN_BANANA_GAP_SEC = 15;
+const MIN_ROTTEN_GAP_SEC = 25;
+
+function shuffleArray(arr) {
+  for (let i = arr.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [arr[i], arr[j]] = [arr[j], arr[i]];
   }
-  return pool[0];
+  return arr;
+}
+
+let veggieQueue = [];
+let veggieQueueIndex = 0;
+
+// Builds this round's spawn order: every carrot/lettuce/banana in
+// PRESET_COUNTS (summing to TARGET_SCORE) shuffled together, with the 2
+// bananas and 2 rotten veggies each spread apart by their minimum gap.
+function buildVeggieQueue() {
+  const base = [];
+  for (let i = 0; i < PRESET_COUNTS.carrot; i++) base.push(VEG_BY_ID.carrot);
+  for (let i = 0; i < PRESET_COUNTS.lettuce; i++) base.push(VEG_BY_ID.lettuce);
+  shuffleArray(base);
+
+  const totalSlots = base.length + PRESET_COUNTS.banana + ROTTEN_COUNT;
+  const slotsPerSecond = totalSlots / GAME_DURATION;
+  const minBananaGapSlots = Math.max(1, Math.ceil(MIN_BANANA_GAP_SEC * slotsPerSecond));
+  const minRottenGapSlots = Math.max(1, Math.ceil(MIN_ROTTEN_GAP_SEC * slotsPerSecond));
+
+  const pickSpreadPair = (count, minGap, excludeSet) => {
+    for (let attempt = 0; attempt < 500; attempt++) {
+      const a = Math.floor(Math.random() * count);
+      const b = Math.floor(Math.random() * count);
+      if (a !== b && Math.abs(a - b) >= minGap && !excludeSet.has(a) && !excludeSet.has(b)) return [a, b];
+    }
+    return [0, Math.min(count - 1, minGap)];
+  };
+
+  const bananaSlots = pickSpreadPair(totalSlots, minBananaGapSlots, new Set());
+  const rottenSlots = pickSpreadPair(totalSlots, minRottenGapSlots, new Set(bananaSlots));
+
+  const slotKind = {};
+  for (const s of bananaSlots) slotKind[s] = 'banana';
+  for (const s of rottenSlots) slotKind[s] = 'rotten';
+
+  const queue = [];
+  let bi = 0;
+  for (let slot = 0; slot < totalSlots; slot++) {
+    if (slotKind[slot] === 'banana') queue.push({ type: VEG_BY_ID.banana });
+    else if (slotKind[slot] === 'rotten') queue.push({ type: ROTTEN_TYPE });
+    else queue.push({ type: base[bi++] });
+  }
+  veggieQueue = queue;
+  veggieQueueIndex = 0;
 }
 
 // ---------- Generic pixel-block helper (used for field, banana) ----------
@@ -349,6 +395,7 @@ function buildBarrySprite(img) {
   barryAspect = sh / sw;
   barrySpriteRedTint = buildTintedVariant(barrySprite, '#ff4d4d');
   barrySpriteGoldTint = buildTintedVariant(barrySprite, '#ffe066');
+  barrySpriteReverseTint = buildTintedVariant(barrySprite, '#a86bff');
 }
 
 // A recolored copy of a sprite, masked to its own silhouette (via
@@ -379,9 +426,6 @@ function buildVeggieSprites(img) {
   const rectFor = {
     carrot:  { x0: 210, x1: 270, y0: 170, y1: 235 }, // carrot, row3
     lettuce: { x0: 20,  x1: 79,  y0: 19,  y1: 86 },  // cauliflower/lettuce head, row1
-    bokchoy: { x0: 477, x1: 529, y0: 170, y1: 235 }, // dense cabbage ball, row3
-    parsley: { x0: 91,  x1: 140, y0: 19,  y1: 86 },  // leafy green floret, row1
-    dill:    { x0: 475, x1: 527, y0: 93,  y1: 166 }, // fennel with wispy top, row2
   };
   for (const id in rectFor) {
     const r = rectFor[id];
@@ -393,6 +437,7 @@ function buildVeggieSprites(img) {
     );
   }
   veggieSprites.banana = buildBananaSprite();
+  veggieSprites.rotten = buildRottenVeggieSprite();
 }
 
 // A properly curved pixel banana (rare speed-boost power-up): a tapered
@@ -442,6 +487,48 @@ function buildBananaSprite() {
   // small green blossom fleck at the tip
   octx.fillStyle = '#4a8c3a';
   octx.fillRect(P0.x - 1.4, P0.y + strokes[0].r * 0.5, 2, 1.6);
+
+  return c;
+}
+
+// Rotten vegetable power-down: a lumpy sickly-yellow-green blob with red rot
+// spots and a few decaying green fragments flaking off the top. Worth 0
+// points and reverses Barry's controls for a few seconds on touch.
+function buildRottenVeggieSprite() {
+  const c = document.createElement('canvas');
+  c.width = 32; c.height = 32;
+  const octx = c.getContext('2d');
+  octx.imageSmoothingEnabled = false;
+
+  const blobStamps = [
+    { x: 9, y: 20, r: 6.5 },
+    { x: 16, y: 17, r: 7.5 },
+    { x: 23, y: 21, r: 6.5 },
+    { x: 12, y: 25, r: 6 },
+    { x: 20, y: 25, r: 6 },
+  ];
+  octx.fillStyle = '#4a3210';
+  for (const s of blobStamps) {
+    octx.beginPath(); octx.arc(s.x, s.y, s.r + 1.2, 0, Math.PI * 2); octx.fill();
+  }
+  octx.fillStyle = '#c7cf4a';
+  for (const s of blobStamps) {
+    octx.beginPath(); octx.arc(s.x, s.y, s.r, 0, Math.PI * 2); octx.fill();
+  }
+  octx.fillStyle = 'rgba(140,140,30,0.5)';
+  for (const s of blobStamps) {
+    octx.beginPath(); octx.arc(s.x, s.y + s.r * 0.35, s.r * 0.8, 0, Math.PI * 2); octx.fill();
+  }
+  octx.fillStyle = '#a83030';
+  const spots = [{ x: 11, y: 18, r: 1.8 }, { x: 19, y: 15, r: 1.6 }, { x: 24, y: 22, r: 1.7 }, { x: 14, y: 26, r: 1.5 }, { x: 21, y: 27, r: 1.4 }];
+  for (const s of spots) {
+    octx.beginPath(); octx.arc(s.x, s.y, s.r, 0, Math.PI * 2); octx.fill();
+  }
+  const flecks = [{ x: 6, y: 6, w: 3, h: 3 }, { x: 13, y: 2, w: 3, h: 3 }, { x: 20, y: 5, w: 3, h: 3 }, { x: 9, y: 10, w: 2.5, h: 2.5 }];
+  octx.fillStyle = '#4a3210';
+  for (const f of flecks) octx.fillRect(f.x - 0.7, f.y - 0.7, f.w + 1.4, f.h + 1.4);
+  octx.fillStyle = '#7fbf4a';
+  for (const f of flecks) octx.fillRect(f.x, f.y, f.w, f.h);
 
   return c;
 }
@@ -660,6 +747,14 @@ function drawBarry() {
     ctx.fillStyle = '#ffe066';
     ctx.font = '14px monospace';
     ctx.fillText('!', barry.x + w * 0.35, dy - 6 + Math.sin(barry.hopPhase * 2) * 4);
+  } else if (barry.reverseTimer > 0) {
+    ctx.globalAlpha = 0.45;
+    ctx.drawImage(barrySpriteReverseTint, dx, dy, w, h);
+    ctx.globalAlpha = 1;
+
+    ctx.fillStyle = '#d9b6ff';
+    ctx.font = '14px monospace';
+    ctx.fillText('⇅', barry.x + w * 0.35, dy - 6 + Math.sin(barry.hopPhase * 2) * 4);
   } else if (barry.boostTimer > 0) {
     ctx.globalAlpha = 0.35;
     ctx.drawImage(barrySpriteGoldTint, dx, dy, w, h);
@@ -686,15 +781,24 @@ function drawVeggie(v) {
 }
 
 // ---------- Chaser (Matt / Jo) drawing ----------
+// The exact on-screen rectangle a chaser's sprite occupies — used for both
+// drawing and hit-testing so the hitbox always matches the visible image.
+function chaserBounds(c) {
+  const sprite = c.person === 'matt' ? mattSprite : joSprite;
+  const scale = c.size / 60;
+  const w = sprite.width * scale, h = sprite.height * scale;
+  const left = c.x - w / 2, top = c.y - h + 8;
+  return { left, top, right: left + w, bottom: top + h, w, h };
+}
+
 function drawChaser(c) {
   const sprite = c.person === 'matt' ? mattSprite : joSprite;
   if (!sprite) return;
   const alpha = Math.min(1, c.age / 0.4, (c.maxLife - c.age) / 0.6);
   ctx.save();
   ctx.globalAlpha = Math.max(0, Math.min(1, alpha));
-  const scale = c.size / 60;
-  const w = sprite.width * scale, h = sprite.height * scale;
-  ctx.drawImage(sprite, c.x - w / 2, c.y - h + 8, w, h);
+  const b = chaserBounds(c);
+  ctx.drawImage(sprite, b.left, b.top, b.w, b.h);
   ctx.restore();
 }
 
@@ -729,13 +833,14 @@ function startGame() {
   barry.y = H / 2;
   barry.slowTimer = 0;
   barry.boostTimer = 0;
+  barry.reverseTimer = 0;
   barry.hitCooldown = 0;
   veggies = [];
   popups = [];
   chasers = [];
   spawnTimer = 0;
   chaserSpawnTimer = 0.3;
-  bananaCooldown = 6;
+  buildVeggieQueue();
   state = 'playing';
 }
 
@@ -746,7 +851,8 @@ function endGame() {
 
 // ---------- Spawning ----------
 function trySpawnVeggie() {
-  if (veggies.length >= 6) return;
+  if (veggieQueueIndex >= veggieQueue.length) return; // this round's preset is exhausted
+  if (veggies.length >= 9) return;
   let attempts = 0;
   while (attempts < 20) {
     attempts++;
@@ -761,9 +867,9 @@ function trySpawnVeggie() {
       if (Math.hypot(x - v.x, y - v.y) < 40) { ok = false; break; }
     }
     if (!ok) continue;
-    const type = pickVeggieType();
-    veggies.push({ x, y, type, life: 4.5, spawnTime: Math.random() * 10 });
-    if (type.id === 'banana') bananaCooldown = 20 + Math.random() * 12;
+    const next = veggieQueue[veggieQueueIndex];
+    veggies.push({ x, y, type: next.type, life: 5, spawnTime: Math.random() * 10 });
+    veggieQueueIndex++;
     return;
   }
 }
@@ -781,6 +887,7 @@ function update(dt) {
   if (keysDown.has('ArrowRight') || keysDown.has('d')) dx += 1;
   if (keysDown.has('ArrowUp') || keysDown.has('w')) dy -= 1;
   if (keysDown.has('ArrowDown') || keysDown.has('s')) dy += 1;
+  if (barry.reverseTimer > 0) { dx = -dx; dy = -dy; }
   barry.moving = dx !== 0 || dy !== 0;
   if (barry.moving) {
     const len = Math.hypot(dx, dy);
@@ -793,8 +900,8 @@ function update(dt) {
   barry.hopPhase += barry.moving ? dt * (barry.boostTimer > 0 ? 15 : 10) : dt * 2;
   if (barry.slowTimer > 0) barry.slowTimer -= dt;
   if (barry.boostTimer > 0) barry.boostTimer -= dt;
+  if (barry.reverseTimer > 0) barry.reverseTimer -= dt;
   if (barry.hitCooldown > 0) barry.hitCooldown -= dt;
-  if (bananaCooldown > 0) bananaCooldown -= dt;
 
   // chasers: random appearance + lifespan + collision (vanish on hit)
   chaserSpawnTimer -= dt;
@@ -807,8 +914,11 @@ function update(dt) {
     c.age += dt;
     if (c.age >= c.maxLife) { chasers.splice(i, 1); continue; }
     if (c.age < 0.4) continue;
-    const d = Math.hypot(barry.x - c.x, barry.y - (c.y - 12));
-    if (d < c.radius && barry.hitCooldown <= 0) {
+    const cb = chaserBounds(c);
+    const closestX = Math.max(cb.left, Math.min(barry.x, cb.right));
+    const closestY = Math.max(cb.top, Math.min(barry.y, cb.bottom));
+    const d = Math.hypot(barry.x - closestX, barry.y - closestY);
+    if (d < barry.radius && barry.hitCooldown <= 0) {
       barry.slowTimer = 1.5;
       barry.hitCooldown = 1.5;
       const name = c.person === 'matt' ? 'MATT' : 'JO';
@@ -818,7 +928,7 @@ function update(dt) {
   }
 
   spawnTimer -= dt;
-  if (spawnTimer <= 0) { trySpawnVeggie(); spawnTimer = 0.55 + Math.random() * 0.5; }
+  if (spawnTimer <= 0) { trySpawnVeggie(); spawnTimer = 0.35 + Math.random() * 0.35; }
 
   for (let i = veggies.length - 1; i >= 0; i--) {
     const v = veggies[i];
@@ -830,6 +940,9 @@ function update(dt) {
       if (v.type.id === 'banana') {
         barry.boostTimer = 4;
         popups.push({ x: v.x, y: v.y, text: '+' + v.type.points + ' SPEED BOOST!', life: 1.1, vy: -45, color: '#fff2a8' });
+      } else if (v.type.id === 'rotten') {
+        barry.reverseTimer = 5;
+        popups.push({ x: v.x, y: v.y, text: 'ROTTEN! CONTROLS REVERSED!', life: 1.1, vy: -45, color: '#b6ff4d' });
       } else {
         popups.push({ x: v.x, y: v.y, text: '+' + v.type.points, life: 0.9, vy: -45, color: '#ffe066' });
       }
@@ -914,6 +1027,7 @@ function drawHome() {
     { text: 'WASD or arrow keys to move', size: 9, color: '#ffffff' },
     { text: 'collect veggies for points!', size: 9, color: '#ffffff' },
     { text: 'avoid being picked up by matt and jo!', size: 9, color: '#ff9838' },
+    { text: 'watch out for rotten veggies!', size: 9, color: '#b6ff4d' },
     { text: 'best: ' + (leaderboard[0] ? leaderboard[0].name + ' - ' + leaderboard[0].score : '---'), size: 10, color: '#a3e35c' },
   ]);
 
@@ -1046,7 +1160,9 @@ canvas.addEventListener('click', () => {
 
 const MOVEMENT_KEYS = new Set(['ArrowLeft', 'ArrowRight', 'ArrowUp', 'ArrowDown', 'w', 'a', 's', 'd']);
 const normalizeKey = (key) => (key.length === 1 ? key.toLowerCase() : key);
+const isTypingTarget = (el) => el && (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA');
 window.addEventListener('keydown', (e) => {
+  if (isTypingTarget(document.activeElement)) return; // let the name field receive every key normally
   const key = normalizeKey(e.key);
   if (MOVEMENT_KEYS.has(key)) {
     e.preventDefault();
@@ -1054,6 +1170,7 @@ window.addEventListener('keydown', (e) => {
   }
 });
 window.addEventListener('keyup', (e) => {
+  if (isTypingTarget(document.activeElement)) return;
   keysDown.delete(normalizeKey(e.key));
 });
 window.addEventListener('blur', () => keysDown.clear());
