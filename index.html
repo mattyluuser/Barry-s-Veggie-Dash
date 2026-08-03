@@ -255,6 +255,8 @@ let popups = [];
 let buttons = [];
 const MAX_CHASERS = 3;
 const TARGET_VEGGIE_SIZE = 37; // normalizes on-field size regardless of a sprite's native pixel resolution
+const VEGGIE_FOOTPRINT_RADIUS = TARGET_VEGGIE_SIZE / 2;
+const SPAWN_OVERLAP_PADDING = 18; // extra gap so a veggie and a chaser never spawn touching, just overlapping bounds
 
 // ---------- Leaderboard (shared across everyone, backed by Firebase Firestore) ----------
 let leaderboardStatus = 'idle'; // idle | loading | error
@@ -815,6 +817,17 @@ function chaserBounds(c) {
   return { left, top, right: left + w, bottom: top + h, w, h };
 }
 
+// Shared by both spawn functions so a veggie and a chaser never land on top
+// of each other: true if a circle (a veggie's footprint) overlaps a padded
+// rectangle (a chaser's actual sprite bounds, from chaserBounds()).
+function rectOverlapsCircle(rect, cx, cy, radius, padding) {
+  const left = rect.left - padding, top = rect.top - padding;
+  const right = rect.right + padding, bottom = rect.bottom + padding;
+  const closestX = Math.max(left, Math.min(cx, right));
+  const closestY = Math.max(top, Math.min(cy, bottom));
+  return Math.hypot(cx - closestX, cy - closestY) < radius;
+}
+
 function drawChaser(c) {
   const sprite = c.person === 'matt' ? mattSprite : joSprite;
   if (!sprite) return;
@@ -876,6 +889,9 @@ function playCaughtSound() {
 // ---------- Setup / reset ----------
 function trySpawnChaser() {
   if (chasers.length >= MAX_CHASERS) return;
+  // picked once up front (not per-attempt) purely so chaserBounds() has a
+  // sprite to measure against while searching for a clear spot below
+  const person = Math.random() < 0.5 ? 'matt' : 'jo';
   let attempts = 0;
   while (attempts < 30) {
     attempts++;
@@ -888,9 +904,16 @@ function trySpawnChaser() {
       if (Math.hypot(x - c.x, y - c.y) < 160) { overlaps = true; break; }
     }
     if (overlaps) continue;
+    // also avoid landing on top of any veggie currently on screen, using the
+    // same padded bounds check trySpawnVeggie() uses in the other direction
+    const candidateBounds = chaserBounds({ x, y, size, person });
+    for (const v of veggies) {
+      if (rectOverlapsCircle(candidateBounds, v.x, v.y, VEGGIE_FOOTPRINT_RADIUS, SPAWN_OVERLAP_PADDING)) { overlaps = true; break; }
+    }
+    if (overlaps) continue;
     chasers.push({
       x, y, size, radius: size * 0.4,
-      person: Math.random() < 0.5 ? 'matt' : 'jo',
+      person,
       age: 0, maxLife: 6 + Math.random() * 6,
     });
     return;
@@ -932,8 +955,10 @@ function trySpawnVeggie() {
     const x = 40 + Math.random() * (W - 80);
     const y = 50 + Math.random() * (H - 90);
     let ok = true;
+    // check against each chaser's actual sprite bounds (not just their small
+    // collision radius) so a veggie never spawns hidden behind/under Matt or Jo
     for (const c of chasers) {
-      if (Math.hypot(x - c.x, y - c.y) < c.radius + 30) { ok = false; break; }
+      if (rectOverlapsCircle(chaserBounds(c), x, y, VEGGIE_FOOTPRINT_RADIUS, SPAWN_OVERLAP_PADDING)) { ok = false; break; }
     }
     if (!ok) continue;
     for (const v of veggies) {
