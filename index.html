@@ -281,10 +281,13 @@ async function submitScore(name, points) {
 // ---------- Veggie definitions ----------
 // Open-ended random spawning: no fixed set, no score cap — veggies spawn
 // continuously for the full round and score is just whatever's collected.
+// Weights favor the higher-value veggies over carrot (previously 30/20/8,
+// which let low-value carrots crowd out the spawn budget and capped realistic
+// scores well below the old fixed-budget high score of 4740).
 const VEG_TYPES = [
-  { id: 'carrot',  points: 20,  weight: 30, name: 'Carrot' },
-  { id: 'lettuce', points: 50,  weight: 20, name: 'Lettuce' },
-  { id: 'dill',    points: 100, weight: 8,  name: 'Dill' },
+  { id: 'carrot',  points: 20,  weight: 18, name: 'Carrot' },
+  { id: 'lettuce', points: 50,  weight: 24, name: 'Lettuce' },
+  { id: 'dill',    points: 100, weight: 14, name: 'Dill' },
   { id: 'banana',  points: 200, weight: 3,  name: 'Banana' },
 ];
 const VEG_BY_ID = Object.fromEntries(VEG_TYPES.map(v => [v.id, v]));
